@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/rpc"
+	"sync"
 )
 
 // Implements rpc.ClientCodec
@@ -17,6 +18,8 @@ type clientCodec struct {
 	onewayRequests chan pendingRequest
 	twowayRequests chan pendingRequest
 	enableOneway   bool
+	closed         bool
+	wg             sync.WaitGroup
 }
 
 type pendingRequest struct {
@@ -49,15 +52,8 @@ func Dial(network, address string, framed bool, protocol ProtocolBuilder, suppor
 	if framed {
 		c = NewFramedReadWriteCloser(conn, DefaultMaxFrameSize)
 	}
-	codec := &clientCodec{
-		conn: NewTransport(c, protocol),
-	}
-	if supportOnewayRequests {
-		codec.enableOneway = true
-		codec.onewayRequests = make(chan pendingRequest, maxPendingRequests)
-		codec.twowayRequests = make(chan pendingRequest, maxPendingRequests)
-	}
-	return rpc.NewClientWithCodec(codec), nil
+	transport := NewTransport(c, protocol)
+	return rpc.NewClientWithCodec(NewClientCodec(transport, supportOnewayRequests)), nil
 }
 
 // NewClient returns a new rpc.Client to handle requests to the set of
@@ -76,10 +72,12 @@ func NewClientCodec(conn Transport, supportOnewayRequests bool) rpc.ClientCodec 
 		c.onewayRequests = make(chan pendingRequest, maxPendingRequests)
 		c.twowayRequests = make(chan pendingRequest, maxPendingRequests)
 	}
+	c.wg.Add(1)
 	return c
 }
 
 func (c *clientCodec) WriteRequest(request *rpc.Request, thriftStruct interface{}) error {
+	defer c.wg.Done()
 	if err := c.conn.WriteMessageBegin(request.ServiceMethod, MessageTypeCall, int32(request.Seq)); err != nil {
 		return err
 	}
@@ -122,6 +120,11 @@ func (c *clientCodec) WriteRequest(request *rpc.Request, thriftStruct interface{
 }
 
 func (c *clientCodec) ReadResponseHeader(response *rpc.Response) error {
+	c.wg.Wait()
+	if c.closed {
+		return rpc.ErrShutdown
+	}
+
 	if c.enableOneway {
 		select {
 		case ow := <-c.onewayRequests:
@@ -136,6 +139,7 @@ func (c *clientCodec) ReadResponseHeader(response *rpc.Response) error {
 	if err != nil {
 		return err
 	}
+
 	response.ServiceMethod = name
 	response.Seq = uint64(seq)
 	if messageType == MessageTypeException {
@@ -146,10 +150,13 @@ func (c *clientCodec) ReadResponseHeader(response *rpc.Response) error {
 		response.Error = exception.String()
 		return c.conn.ReadMessageEnd()
 	}
+
 	return nil
 }
 
 func (c *clientCodec) ReadResponseBody(thriftStruct interface{}) error {
+	defer c.wg.Add(1)
+
 	if thriftStruct == nil {
 		// Should only get called if ReadResponseHeader set the Error value in
 		// which case we've already read the body (ApplicationException)
@@ -164,8 +171,21 @@ func (c *clientCodec) ReadResponseBody(thriftStruct interface{}) error {
 }
 
 func (c *clientCodec) Close() error {
+	c.closed = true
+	c.wg.Done()
+
+	if c.enableOneway {
+		close(c.onewayRequests)
+		close(c.twowayRequests)
+	}
+
+	if err := c.conn.Flush(); err != nil {
+		return err
+	}
+
 	if cl, ok := c.conn.(io.Closer); ok {
 		return cl.Close()
 	}
+
 	return nil
 }
