@@ -137,6 +137,7 @@ func (c *clientCodec) ReadResponseHeader(response *rpc.Response) error {
 
 	name, messageType, seq, err := c.conn.ReadMessageBegin()
 	if err != nil {
+		c.wg.Add(1)
 		return err
 	}
 
@@ -145,10 +146,16 @@ func (c *clientCodec) ReadResponseHeader(response *rpc.Response) error {
 	if messageType == MessageTypeException {
 		exception := &ApplicationException{}
 		if err := DecodeStruct(c.conn, exception); err != nil {
+			c.wg.Add(1)
 			return err
 		}
 		response.Error = exception.String()
-		return c.conn.ReadMessageEnd()
+		err := c.conn.ReadMessageEnd()
+		if err != nil {
+			c.wg.Add(1)
+			return err
+		}
+		return nil
 	}
 
 	return nil
